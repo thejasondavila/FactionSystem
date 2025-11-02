@@ -1,0 +1,1947 @@
+-- // FACTIONHANDLER MODULE SCRIPT LOCATED IN SERVERSCRIPTSERVICE // --
+
+--[[
+	FACTION SYSTEM
+	Author: Celuxis
+	Version: 2.0
+	Last Updated: November 2025
+--]]
+
+-- SERVICE DECLARATIONS
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local MessagingService = game:GetService("MessagingService")
+
+-- DATASTORE INITIALIZATION
+-- Separate DataStores for different data types to optimize read/write operations
+local FactionsStore = DataStoreService:GetDataStore("Factions_NEW")
+local PlayerFactionsStore = DataStoreService:GetDataStore("PlayerFactions_NEW")
+local RenownLeaderboard = DataStoreService:GetOrderedDataStore("FactionRenown_NEW")
+local FactionJoinCodes = DataStoreService:GetDataStore("FactionJoinCodes_NEW")
+local FactionTerritories = DataStoreService:GetDataStore("FactionTerritories_NEW")
+
+-- CACHE SYSTEM
+--[[
+	Caching reduces DataStore API calls by storing frequently accessed data in memory.
+	We use staggered expiration to prevent all caches from refreshing simultaneously,
+	which could cause request spikes and throttling.
+--]]
+local factionCache = {} -- Stores complete faction data: {[factionName] = factionData}
+local playerFactionCache = {} -- Maps players to their faction: {[userId] = factionName}
+local territoryCache = {} -- Stores faction territories: {[factionName] = territoryData}
+local cacheExpirationTimes = {} -- Tracks when each faction cache should expire
+local CACHE_REFRESH_INTERVAL = 300 -- Base cache lifetime: 5 minutes
+
+-- OPTIMIZATION SYSTEMS
+--[[
+	These systems reduce DataStore writes and MessagingService calls:
+	1. Renown Batching: Accumulates small renown changes and writes them in bulk
+	2. Broadcast Throttling: Prevents excessive cross-server update notifications
+	3. Rate Limiting: Prevents individual players from spamming operations
+--]]
+
+-- Renown batching system: Accumulates renown changes before writing to DataStore
+local pendingRenown = {} -- {[factionName] = accumulatedAmount}
+local RENOWN_BATCH_INTERVAL = 60 -- Flush accumulated renown every 60 seconds
+local RENOWN_BATCH_THRESHOLD = 10 -- Or flush immediately when threshold is reached
+
+-- MessagingService throttling: Prevents excessive cross-server broadcasts
+local lastBroadcast = {} -- {[factionName] = lastBroadcastTimestamp}
+local BROADCAST_COOLDOWN = 30 -- Minimum 30 seconds between broadcasts per faction
+
+-- Per-player rate limiting: Prevents individual players from spamming operations
+local playerLastRequest = {} -- {[userId] = {[operation] = lastRequestTimestamp}}
+local PLAYER_OPERATION_COOLDOWN = 2 -- Minimum 2 seconds between operations per player
+
+-- ========== CONSTANTS ==========
+local LEADER_RANK_NUMBER = 20 -- Highest rank number (reserved for faction leader)
+local DEFAULT_RANK_NUMBER = 1 -- New members automatically receive this rank
+local ARMORY_CAPACITY = 10 -- Maximum items that can be stored in faction armory
+local MAX_MEMBERS = 50 -- Maximum members allowed per faction
+local TERRITORY_RADIUS = 100 -- Default radius for faction territories (in studs)
+
+-- MESSAGINGSERVICE TOPICS
+-- Topics for cross-server communication via MessagingService
+local FACTION_UPDATE_TOPIC = "FactionUpdates" -- Notifies servers of faction data changes
+local FACTION_KICK_TOPIC = "FactionKicks" -- Notifies servers when a player is kicked
+
+-- MAIN MODULE TABLE
+local Factions = {}
+
+-- METATABLE IMPLEMENTATION
+--[[
+	Using metatables to create an Object-Oriented Programming (OOP) design pattern.
+	The Faction metatable allows us to create faction objects with methods, making
+	the code more organized and demonstrating advanced Luau programming concepts.
+	
+	Metamethods used:
+	- __index: Allows method calls on faction objects
+	- __tostring: Provides readable string representation of faction objects
+--]]
+
+local FactionMeta = {}
+FactionMeta.__index = FactionMeta
+
+-- Metatable constructor: Creates a new Faction object from raw data
+function FactionMeta.new(factionData)
+	local self = setmetatable({}, FactionMeta)
+	
+	-- Copy all properties from raw data to the object
+	for key, value in pairs(factionData) do
+		self[key] = value
+	end
+	
+	return self
+end
+
+-- Metamethod: Provides string representation of faction for debugging
+function FactionMeta:__tostring()
+	return string.format("Faction[%s] - Members: %d, Renown: %d, Leader: %d",
+		self.Name,
+		self:GetMemberCount(),
+		self:GetRenown(),
+		self.Leader
+	)
+end
+
+-- Method: Get total number of members in the faction
+function FactionMeta:GetMemberCount()
+	local count = 0
+	for _ in pairs(self.Members) do
+		count = count + 1
+	end
+	return count
+end
+
+-- Method: Get current renown (including pending batched renown)
+function FactionMeta:GetRenown()
+	local storedRenown = self.Renown or 0
+	local pendingAmount = pendingRenown[self.Name] or 0
+	return storedRenown + pendingAmount
+end
+
+-- Method: Check if faction is at member capacity
+function FactionMeta:IsFull()
+	return self:GetMemberCount() >= MAX_MEMBERS
+end
+
+-- Method: Check if a user is a member of this faction
+function FactionMeta:IsMember(userId)
+	return self.Members[tostring(userId)] ~= nil
+end
+
+-- Method: Get a member's rank object
+function FactionMeta:GetMemberRank(userId)
+	local rankName = self.Members[tostring(userId)]
+	if not rankName then
+		return nil
+	end
+	
+	return self:FindRank(rankName)
+end
+
+-- Method: Find a rank by name
+function FactionMeta:FindRank(rankName)
+	for _, rank in ipairs(self.Ranks) do
+		if rank.RankName == rankName then
+			return rank
+		end
+	end
+	return nil
+end
+
+-- Method: Check if a user has a specific permission
+function FactionMeta:HasPermission(userId, permission)
+	-- Leaders always have all permissions
+	if self.Leader == userId then
+		return true
+	end
+	
+	local rank = self:GetMemberRank(userId)
+	if not rank then
+		return false
+	end
+	
+	return rank.Permissions and rank.Permissions[permission] == true
+end
+
+-- Method: Check if manager can manage target based on rank hierarchy
+function FactionMeta:CanManageUser(managerId, targetUserId)
+	-- Cannot manage yourself
+	if managerId == targetUserId then
+		return false
+	end
+	
+	local managerRank = self:GetMemberRank(managerId)
+	local targetRank = self:GetMemberRank(targetUserId)
+	
+	if not managerRank or not targetRank then
+		return false
+	end
+	
+	-- Can only manage users with lower rank numbers
+	return managerRank.RankNumber > targetRank.RankNumber
+end
+
+-- Method: Convert faction object back to raw data for DataStore storage
+function FactionMeta:ToRawData()
+	local rawData = {}
+	
+	-- Copy all properties except metatable methods
+	for key, value in pairs(self) do
+		if type(value) ~= "function" then
+			rawData[key] = value
+		end
+	end
+	
+	return rawData
+end
+
+-- TERRITORY SYSTEM (CFrame Mathematics)
+--[[
+	This system demonstrates advanced usage of CFrame and Vector3 mathematics.
+	Factions can claim territories in 3D space, and we use spatial calculations
+	to determine if a position is within a faction's territory.
+--]]
+
+-- Method: Calculate if a position is within the faction's territory
+function FactionMeta:IsPositionInTerritory(position)
+	if not self.Territory then
+		return false
+	end
+	
+	--[[
+		Using Vector3 mathematics to calculate distance from territory center.
+		The territory is represented as a sphere with a center point and radius.
+		We calculate the magnitude (distance) between the position and center,
+		then compare it to the territory radius.
+	--]]
+	local territoryCenter = self.Territory.Center
+	local territoryRadius = self.Territory.Radius
+	
+	-- Calculate the displacement vector from center to position
+	local displacement = position - territoryCenter
+	
+	-- Calculate the distance using vector magnitude
+	local distance = displacement.Magnitude
+	
+	-- Position is in territory if distance is less than radius
+	return distance <= territoryRadius
+end
+
+-- Method: Get all corners of the territory bounding box (demonstrates CFrame usage)
+function FactionMeta:GetTerritoryBounds()
+	if not self.Territory then
+		return nil
+	end
+	
+	local center = self.Territory.Center
+	local radius = self.Territory.Radius
+	
+	--[[
+		Create a CFrame at the territory center, then use it to calculate
+		the 8 corners of a bounding box around the territory sphere.
+		This demonstrates CFrame transformation mathematics.
+	--]]
+	local territoryCFrame = CFrame.new(center)
+	
+	-- Calculate the 8 corners of the bounding box using CFrame:PointToWorldSpace
+	local corners = {
+		territoryCFrame:PointToWorldSpace(Vector3.new(radius, radius, radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(radius, radius, -radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(radius, -radius, radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(radius, -radius, -radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(-radius, radius, radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(-radius, radius, -radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(-radius, -radius, radius)),
+		territoryCFrame:PointToWorldSpace(Vector3.new(-radius, -radius, -radius))
+	}
+	
+	return corners
+end
+
+-- UTILITY FUNCTIONS
+
+-- Error logging function with consistent formatting
+local function logError(operation, err)
+	warn(string.format("[Factions] Error in %s: %s", operation, tostring(err)))
+end
+
+-- Generate random 7-digit join code for faction invitations
+local function generateJoinCode()
+	return tostring(math.random(1000000, 9999999))
+end
+
+-- ========== RATE LIMITING SYSTEM ==========
+--[[
+	Prevents players from spamming operations that could cause DataStore throttling.
+	Each operation type has its own cooldown timer per player.
+--]]
+local function checkPlayerRateLimit(userId, operation)
+	local now = os.time()
+	
+	-- Initialize player's rate limit table if it doesn't exist
+	if not playerLastRequest[userId] then
+		playerLastRequest[userId] = {}
+	end
+	
+	local lastTime = playerLastRequest[userId][operation] or 0
+	
+	-- Check if enough time has passed since last operation
+	if now - lastTime < PLAYER_OPERATION_COOLDOWN then
+		return false, "Please wait before performing this action again"
+	end
+	
+	-- Update the last request time for this operation
+	playerLastRequest[userId][operation] = now
+	return true, nil
+end
+
+-- CACHE MANAGEMENT
+--[[
+	Staggered cache expiration prevents all caches from refreshing at once,
+	which could cause DataStore request spikes and trigger throttling.
+--]]
+
+-- Set cache with randomized expiration time
+local function setCacheWithExpiration(factionName, data)
+	factionCache[factionName] = data
+	
+	-- Add random offset (-60 to +60 seconds) to stagger cache expirations
+	local randomOffset = math.random(-60, 60)
+	cacheExpirationTimes[factionName] = os.time() + CACHE_REFRESH_INTERVAL + randomOffset
+end
+
+-- Periodic cache cleanup loop
+task.spawn(function()
+	while true do
+		task.wait(30) -- Check every 30 seconds
+		local now = os.time()
+		
+		-- Remove expired caches
+		for factionName, expirationTime in pairs(cacheExpirationTimes) do
+			if now >= expirationTime then
+				factionCache[factionName] = nil
+				cacheExpirationTimes[factionName] = nil
+			end
+		end
+	end
+end)
+
+-- MESSAGINGSERVICE INTEGRATION
+--[[
+	MessagingService enables cross-server communication. When faction data changes
+	on one server, we broadcast the update to all servers so they can invalidate
+	their cached data. This ensures consistency across all game servers.
+--]]
+
+-- Broadcast faction update to all servers (with throttling to prevent spam)
+local function broadcastFactionUpdate(factionName, updateType)
+	local now = os.time()
+	local lastTime = lastBroadcast[factionName] or 0
+	
+	-- Skip if we recently broadcasted for this faction (throttling)
+	if now - lastTime < BROADCAST_COOLDOWN then
+		return
+	end
+	
+	lastBroadcast[factionName] = now
+	
+	-- Publish update message to all servers
+	pcall(function()
+		MessagingService:PublishAsync(FACTION_UPDATE_TOPIC, {
+			FactionName = factionName,
+			UpdateType = updateType,
+			Timestamp = now
+		})
+	end)
+end
+
+-- Listen for faction updates from other servers and invalidate local cache
+pcall(function()
+	MessagingService:SubscribeAsync(FACTION_UPDATE_TOPIC, function(message)
+		local data = message.Data
+		local factionName = data.FactionName
+		
+		-- Invalidate cache to force reload from DataStore on next access
+		factionCache[factionName] = nil
+		cacheExpirationTimes[factionName] = nil
+	end)
+end)
+
+-- Listen for player kicks from other servers
+pcall(function()
+	MessagingService:SubscribeAsync(FACTION_KICK_TOPIC, function(message)
+		local kickedUserId = message.Data.UserId
+		local player = Players:GetPlayerByUserId(kickedUserId)
+		
+		-- If the kicked player is on this server, disconnect them
+		if player then
+			player:Kick("You have been removed from your faction.")
+		end
+	end)
+end)
+
+-- RENOWN BATCHING SYSTEM
+--[[
+	Instead of writing to DataStore every time renown is awarded (which could cause
+	throttling), we accumulate renown changes in memory and flush them periodically
+	or when a threshold is reached. This dramatically reduces DataStore write operations.
+--]]
+
+-- Accumulate renown changes in memory
+local function accumulateRenown(factionName, amount)
+	pendingRenown[factionName] = (pendingRenown[factionName] or 0) + amount
+	
+	-- If threshold reached, flush immediately to DataStore
+	if pendingRenown[factionName] >= RENOWN_BATCH_THRESHOLD then
+		return Factions.FlushRenown(factionName)
+	end
+	
+	return true, "Renown accumulated (will update shortly)"
+end
+
+-- Flush accumulated renown to DataStore
+function Factions.FlushRenown(factionName)
+	local amount = pendingRenown[factionName]
+	
+	-- Nothing to flush
+	if not amount or amount <= 0 then
+		return true, "No pending renown"
+	end
+	
+	-- Clear pending amount before attempting write
+	pendingRenown[factionName] = nil
+	
+	--[[
+		Using UpdateAsync instead of SetAsync for atomic updates.
+		UpdateAsync provides the current value and ensures no data is lost
+		if multiple servers try to update simultaneously.
+	--]]
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Add accumulated renown to stored renown
+			factionData.Renown = (factionData.Renown or 0) + amount
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("FlushRenown", result)
+		-- Put the renown back if write failed
+		pendingRenown[factionName] = (pendingRenown[factionName] or 0) + amount
+		return false, "Failed to flush renown"
+	end
+	
+	if not result then
+		return false, "Faction does not exist"
+	end
+	
+	-- Update leaderboard with new renown value
+	pcall(function()
+		RenownLeaderboard:SetAsync(factionName, result.Renown)
+	end)
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, result.Renown
+end
+
+-- Periodic renown flushing background task
+task.spawn(function()
+	while true do
+		task.wait(RENOWN_BATCH_INTERVAL)
+		
+		-- Flush all pending renown for all factions
+		for factionName, amount in pairs(pendingRenown) do
+			if amount > 0 then
+				Factions.FlushRenown(factionName)
+			end
+		end
+	end
+end)
+
+-- Force flush all renown immediately (used during server shutdown)
+function Factions.ForceFlushAllRenown()
+	for factionName, amount in pairs(pendingRenown) do
+		if amount > 0 then
+			Factions.FlushRenown(factionName)
+		end
+	end
+end
+
+-- PLAYER FACTION MANAGEMENT
+
+-- Get the faction that a player belongs to
+function Factions.GetPlayerFaction(userId)
+	-- Check cache first
+	if playerFactionCache[userId] then
+		return playerFactionCache[userId]
+	end
+	
+	-- Cache miss: Fetch from DataStore
+	local success, factionName = pcall(function()
+		return PlayerFactionsStore:GetAsync(tostring(userId))
+	end)
+	
+	if not success then
+		logError("GetPlayerFaction", factionName)
+		return nil
+	end
+	
+	-- Cache the result
+	if factionName then
+		playerFactionCache[userId] = factionName
+		return factionName
+	end
+	
+	return nil
+end
+
+-- Save player's faction membership (internal function)
+local function savePlayerFaction(userId, factionName)
+	playerFactionCache[userId] = factionName
+	
+	local success, err = pcall(function()
+		if factionName then
+			PlayerFactionsStore:SetAsync(tostring(userId), factionName)
+		else
+			-- Remove player from faction mapping
+			PlayerFactionsStore:RemoveAsync(tostring(userId))
+		end
+	end)
+	
+	if not success then
+		logError("savePlayerFaction", err)
+	end
+end
+
+-- FACTION DATA OPERATIONS
+
+-- Get faction information (returns Faction object with metatable methods)
+function Factions.GetFactionInfo(factionName)
+	-- Check cache first
+	if factionCache[factionName] then
+		return FactionMeta.new(factionCache[factionName])
+	end
+	
+	-- Cache miss: Fetch from DataStore
+	local success, factionData = pcall(function()
+		return FactionsStore:GetAsync(factionName)
+	end)
+	
+	if not success then
+		logError("GetFactionInfo", factionData)
+		return nil
+	end
+	
+	if factionData then
+		setCacheWithExpiration(factionName, factionData)
+		-- Return faction object with metatable methods
+		return FactionMeta.new(factionData)
+	end
+	
+	return nil
+end
+
+-- Get faction by join code (reverse lookup)
+function Factions.GetFactionByJoinCode(joinCode)
+	local success, factionName = pcall(function()
+		return FactionJoinCodes:GetAsync(joinCode)
+	end)
+	
+	if not success or not factionName then
+		return nil, "Invalid join code"
+	end
+	
+	return Factions.GetFactionInfo(factionName)
+end
+
+-- FACTION CREATION
+
+-- Create a new faction
+function Factions.CreateFaction(factionName, creatorUserId)
+	local generatedCode = generateJoinCode()
+	
+	--[[
+		Using UpdateAsync with a transform function ensures atomic creation.
+		If the faction already exists, UpdateAsync returns nil without modifying it.
+		This prevents race conditions where two players try to create the same faction.
+	--]]
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(oldData)
+			-- Faction already exists, abort creation
+			if oldData then
+				return nil
+			end
+			
+			-- Create new faction data structure
+			return {
+				Name = factionName,
+				Leader = creatorUserId,
+				Ranks = {
+					{
+						RankName = "Leader",
+						RankNumber = LEADER_RANK_NUMBER,
+						Permissions = {
+							RankMembers = true,
+							KickMembers = true,
+							ManageRanks = true,
+							ManageArmory = true,
+							WithdrawThaler = true,
+							ManageFaction = true,
+							EditArmor = true,
+							EditImage = true,
+							SetColor = true,
+							GenerateJoinCode = true
+						}
+					},
+					{
+						RankName = "Member",
+						RankNumber = DEFAULT_RANK_NUMBER,
+						Permissions = {
+							RankMembers = false,
+							KickMembers = false,
+							ManageRanks = false,
+							ManageArmory = false,
+							WithdrawThaler = false,
+							ManageFaction = false,
+							EditArmor = false,
+							EditImage = false,
+							SetColor = false,
+							GenerateJoinCode = false
+						}
+					}
+				},
+				Members = {
+					[tostring(creatorUserId)] = "Leader"
+				},
+				Thaler = 0,
+				Armory = {},
+				Renown = 0,
+				ShirtId = "86956097495632",
+				PantsId = "122818513503376",
+				ImageId = "7169354142",
+				Color = {r = 255, g = 255, b = 255},
+				JoinCode = generatedCode,
+				Created = os.time(),
+				Territory = nil -- Territory can be claimed later
+			}
+		end)
+	end)
+	
+	if not success then
+		logError("CreateFaction", result)
+		return false, "Failed to create faction"
+	end
+	
+	if not result then
+		return false, "Faction already exists"
+	end
+	
+	-- Cache the new faction
+	setCacheWithExpiration(factionName, result)
+	savePlayerFaction(creatorUserId, factionName)
+	
+	-- Store join code mapping
+	pcall(function()
+		RenownLeaderboard:SetAsync(factionName, 0)
+		FactionJoinCodes:SetAsync(generatedCode, factionName)
+	end)
+	
+	broadcastFactionUpdate(factionName, "Create")
+	return true, "Faction created successfully"
+end
+
+-- Upload/Import a premade faction (for migration purposes)
+function Factions.UploadFaction(name, creatorId, color, imageId, renown, pantsId, shirtId, factionRanks, members)
+	-- Validate required fields
+	if not name or not creatorId then
+		return false, "Name and creatorId are required"
+	end
+	
+	-- Set defaults for optional fields
+	color = color or {r = 255, g = 255, b = 255}
+	imageId = imageId or "7169354142"
+	renown = renown or 0
+	pantsId = pantsId or "122818513503376"
+	shirtId = shirtId or "86956097495632"
+	
+	factionRanks = factionRanks or {
+		{
+			RankName = "Leader",
+			RankNumber = LEADER_RANK_NUMBER,
+			Permissions = {
+				RankMembers = true,
+				KickMembers = true,
+				ManageRanks = true,
+				ManageArmory = true,
+				WithdrawThaler = true,
+				ManageFaction = true,
+				EditArmor = true,
+				EditImage = true,
+				SetColor = true,
+				GenerateJoinCode = true
+			}
+		},
+		{
+			RankName = "Member",
+			RankNumber = DEFAULT_RANK_NUMBER,
+			Permissions = {
+				RankMembers = false,
+				KickMembers = false,
+				ManageRanks = false,
+				ManageArmory = false,
+				WithdrawThaler = false,
+				ManageFaction = false,
+				EditArmor = false,
+				EditImage = false,
+				SetColor = false,
+				GenerateJoinCode = false
+			}
+		}
+	}
+	
+	members = members or {[tostring(creatorId)] = "Leader"}
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(name, function(oldData)
+			if oldData then
+				return nil -- Faction already exists
+			end
+			
+			return {
+				Name = name,
+				Leader = creatorId,
+				Ranks = factionRanks,
+				Members = members,
+				Thaler = 0,
+				Armory = {},
+				Renown = renown,
+				ShirtId = shirtId,
+				PantsId = pantsId,
+				ImageId = imageId,
+				Color = color,
+				JoinCode = generateJoinCode(),
+				Created = os.time(),
+				Territory = nil
+			}
+		end)
+	end)
+	
+	if not success then
+		logError("UploadFaction", result)
+		return false, "Failed to upload faction"
+	end
+	
+	if not result then
+		return false, "Faction already exists"
+	end
+	
+	setCacheWithExpiration(name, result)
+	
+	pcall(function()
+		RenownLeaderboard:SetAsync(name, renown)
+	end)
+	
+	broadcastFactionUpdate(name, "Create")
+	return true, "Faction uploaded successfully"
+end
+
+-- JOINING AND LEAVING FACTIONS
+
+-- Join faction using faction name directly (optimized method)
+function Factions.JoinFaction(userId, factionName)
+	-- Check if player is already in a faction
+	local currentFaction = Factions.GetPlayerFaction(userId)
+	if currentFaction then
+		return false, "Already in a faction. Leave your current faction first."
+	end
+	
+	--[[
+		Using UpdateAsync to atomically check member limit and add member.
+		This prevents race conditions where multiple players join simultaneously
+		and exceed the member limit.
+	--]]
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Check member limit
+			local memberCount = 0
+			for _ in pairs(factionData.Members) do
+				memberCount = memberCount + 1
+			end
+			
+			if memberCount >= MAX_MEMBERS then
+				return nil
+			end
+			
+			-- Add member with default rank
+			factionData.Members[tostring(userId)] = "Member"
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("JoinFaction", result)
+		return false, "Failed to join faction"
+	end
+	
+	if not result then
+		return false, "Faction not found or is full"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	savePlayerFaction(userId, factionName)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Joined " .. factionName
+end
+
+-- Join faction using join code (invitations system)
+function Factions.JoinFactionByJoinCode(userId, joinCode)
+	-- First, resolve the join code to a faction name
+	local success, factionName = pcall(function()
+		return FactionJoinCodes:GetAsync(joinCode)
+	end)
+	
+	if not success or not factionName then
+		return false, "Invalid join code"
+	end
+	
+	-- Use the main join function with the resolved faction name
+	return Factions.JoinFaction(userId, factionName)
+end
+
+-- Leave faction (leaders will delete the faction instead)
+function Factions.LeaveFaction(userId)
+	local factionName = Factions.GetPlayerFaction(userId)
+	if not factionName then
+		return false, "Not in a faction"
+	end
+	
+	-- Get faction data to check if user is leader
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return false, "Faction not found"
+	end
+	
+	-- If leader is leaving, delete the entire faction
+	if factionData.Leader == userId then
+		return Factions.DeleteFaction(userId, factionName)
+	end
+	
+	-- Regular member leaving
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Remove member from faction
+			factionData.Members[tostring(userId)] = nil
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("LeaveFaction", result)
+		return false, "Failed to leave faction"
+	end
+	
+	if not result then
+		return false, "Faction doesn't exist"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	savePlayerFaction(userId, nil)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Left faction"
+end
+
+-- FACTION DELETION
+
+-- Delete faction (leader only)
+function Factions.DeleteFaction(userId, factionName)
+	local memberIds = {}
+	
+	--[[
+		Two-phase deletion process:
+		1. Atomically verify permissions and collect member IDs
+		2. Clean up all related data outside the atomic operation
+		
+		This prevents yielding inside UpdateAsync, which could cause issues.
+	--]]
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Only leader can delete faction
+			if factionData.Leader ~= userId then
+				return nil
+			end
+			
+			-- Collect member IDs for cleanup (don't yield here)
+			for memberUserId in pairs(factionData.Members) do
+				table.insert(memberIds, tonumber(memberUserId))
+			end
+			
+			-- Return empty table to mark for deletion
+			return {}
+		end)
+	end)
+	
+	if not success then
+		logError("DeleteFaction", result)
+		return false, "Failed to delete faction"
+	end
+	
+	if not result then
+		return false, "Permission denied or faction doesn't exist"
+	end
+	
+	-- Clean up all members' faction mappings
+	for _, memberUserId in ipairs(memberIds) do
+		savePlayerFaction(memberUserId, nil)
+	end
+	
+	-- Remove faction from DataStore
+	pcall(function()
+		FactionsStore:RemoveAsync(factionName)
+	end)
+	
+	-- Remove from leaderboard
+	pcall(function()
+		RenownLeaderboard:RemoveAsync(factionName)
+	end)
+	
+	-- Clear all cached data related to this faction
+	factionCache[factionName] = nil
+	cacheExpirationTimes[factionName] = nil
+	pendingRenown[factionName] = nil
+	lastBroadcast[factionName] = nil
+	territoryCache[factionName] = nil
+	
+	broadcastFactionUpdate(factionName, "Delete")
+	return true, "Faction deleted"
+end
+
+-- RANK MANAGEMENT
+
+-- Set member's rank (requires RankMembers permission and rank hierarchy)
+function Factions.SetMemberRank(promoterId, targetUserId, factionName, newRankName)
+	-- Cannot change your own rank
+	if promoterId == targetUserId then
+		return false, "Cannot change your own rank"
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Create faction object to use metatable methods
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(promoterId, "RankMembers") then
+				return nil
+			end
+			
+			-- Check if target is a member
+			if not faction:IsMember(targetUserId) then
+				return nil
+			end
+			
+			-- Check rank hierarchy (can only rank people below you)
+			if not faction:CanManageUser(promoterId, targetUserId) then
+				return nil
+			end
+			
+			-- Verify new rank exists
+			local newRank = faction:FindRank(newRankName)
+			if not newRank then
+				return nil
+			end
+			
+			-- Cannot promote someone to a rank equal to or higher than promoter's
+			local promoterRank = faction:GetMemberRank(promoterId)
+			if not promoterRank or newRank.RankNumber >= promoterRank.RankNumber then
+				return nil
+			end
+			
+			-- Update member's rank
+			factionData.Members[tostring(targetUserId)] = newRankName
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("SetMemberRank", result)
+		return false, "Failed to set rank"
+	end
+	
+	if not result then
+		return false, "Permission denied, invalid rank, or hierarchy violation"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Rank updated"
+end
+
+-- Create a new rank (requires ManageRanks permission)
+function Factions.CreateRank(userId, factionName, rankName, rankNumber, permissions)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(userId, "ManageRanks") then
+				return nil
+			end
+			
+			-- Check if rank name already exists
+			if faction:FindRank(rankName) then
+				return nil
+			end
+			
+			-- Cannot create a rank equal to or higher than creator's rank
+			local creatorRank = faction:GetMemberRank(userId)
+			if not creatorRank or rankNumber >= creatorRank.RankNumber then
+				return nil
+			end
+			
+			-- Create new rank with specified or default permissions
+			table.insert(factionData.Ranks, {
+				RankName = rankName,
+				RankNumber = rankNumber,
+				Permissions = permissions or {
+					RankMembers = false,
+					KickMembers = false,
+					ManageRanks = false,
+					ManageArmory = false,
+					WithdrawThaler = false,
+					ManageFaction = false,
+					EditArmor = false,
+					EditImage = false,
+					SetColor = false,
+					GenerateJoinCode = false
+				}
+			})
+			
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("CreateRank", result)
+		return false, "Failed to create rank"
+	end
+	
+	if not result then
+		return false, "Permission denied, rank exists, or invalid rank number"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Rank created"
+end
+
+-- Delete a rank (requires ManageRanks permission)
+function Factions.DeleteRank(userId, factionName, rankName)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(userId, "ManageRanks") then
+				return nil
+			end
+			
+			-- Cannot delete Leader or Member ranks (system ranks)
+			if rankName == "Leader" or rankName == "Member" then
+				return nil
+			end
+			
+			-- Find rank to delete
+			local rankToDelete = faction:FindRank(rankName)
+			if not rankToDelete then
+				return nil
+			end
+			
+			-- Cannot delete ranks equal to or higher than deleter's rank
+			local deleterRank = faction:GetMemberRank(userId)
+			if not deleterRank or rankToDelete.RankNumber >= deleterRank.RankNumber then
+				return nil
+			end
+			
+			-- Check if any members have this rank
+			for _, memberRank in pairs(factionData.Members) do
+				if memberRank == rankName then
+					return nil -- Cannot delete rank with active members
+				end
+			end
+			
+			-- Remove the rank from the ranks array
+			for i, rank in ipairs(factionData.Ranks) do
+				if rank.RankName == rankName then
+					table.remove(factionData.Ranks, i)
+					break
+				end
+			end
+			
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("DeleteRank", result)
+		return false, "Failed to delete rank"
+	end
+	
+	if not result then
+		return false, "Permission denied, rank has members, or cannot delete this rank"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Rank deleted"
+end
+
+-- Edit rank properties (requires ManageRanks permission)
+function Factions.EditRank(userId, factionName, oldRankName, newRankName, newRankNumber, newPermissions)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(userId, "ManageRanks") then
+				return nil
+			end
+			
+			-- Cannot edit Leader rank (system rank)
+			if oldRankName == "Leader" then
+				return nil
+			end
+			
+			-- Find the rank to edit
+			local rank = faction:FindRank(oldRankName)
+			if not rank then
+				return nil
+			end
+			
+			-- Cannot edit ranks equal to or higher than editor's rank
+			local editorRank = faction:GetMemberRank(userId)
+			if not editorRank or rank.RankNumber >= editorRank.RankNumber then
+				return nil
+			end
+			
+			-- If changing rank number, validate it
+			if newRankNumber then
+				-- Must be in valid range and below editor's rank
+				if newRankNumber < 1 or newRankNumber > 19 or newRankNumber >= editorRank.RankNumber then
+					return nil
+				end
+				
+				-- Check if new rank number is already taken by another rank
+				for _, r in ipairs(factionData.Ranks) do
+					if r.RankNumber == newRankNumber and r.RankName ~= oldRankName then
+						return nil
+					end
+				end
+				
+				rank.RankNumber = newRankNumber
+			end
+			
+			-- If renaming, validate new name
+			if newRankName and newRankName ~= oldRankName then
+				-- Cannot rename to "Leader" or an existing rank name
+				if newRankName == "Leader" or faction:FindRank(newRankName) then
+					return nil
+				end
+				
+				rank.RankName = newRankName
+				
+				-- Update all members who have this rank (FIX: Members store rank as string)
+				for memberId, memberRankName in pairs(factionData.Members) do
+					if memberRankName == oldRankName then
+						factionData.Members[memberId] = newRankName
+					end
+				end
+			end
+			
+			-- Update permissions if provided
+			if newPermissions then
+				rank.Permissions = newPermissions
+			end
+			
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("EditRank", result)
+		return false, "Failed to edit rank"
+	end
+	
+	if not result then
+		return false, "Permission denied, invalid rank, or name/number conflict"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Rank updated"
+end
+
+-- Get faction members
+function Factions.GetMembers(factionName)
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return nil, "Faction not found"
+	end
+	return factionData.Members
+end
+
+-- Get faction ranks
+function Factions.GetRanks(factionName)
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return nil, "Faction not found"
+	end
+	return factionData.Ranks
+end
+
+-- LEADERSHIP TRANSFER
+
+-- Transfer leadership to another member (leader only)
+function Factions.TransferLeadership(currentLeaderId, newLeaderId, factionName)
+	if currentLeaderId == newLeaderId then
+		return false, "Cannot transfer to yourself"
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Only current leader can transfer leadership
+			if factionData.Leader ~= currentLeaderId then
+				return nil
+			end
+			
+			-- New leader must be a member
+			if not factionData.Members[tostring(newLeaderId)] then
+				return nil
+			end
+			
+			-- Update ranks and leader
+			factionData.Members[tostring(currentLeaderId)] = "Member"
+			factionData.Members[tostring(newLeaderId)] = "Leader"
+			factionData.Leader = newLeaderId
+			
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("TransferLeadership", result)
+		return false, "Failed to transfer leadership"
+	end
+	
+	if not result then
+		return false, "Permission denied or new leader not in faction"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Leadership transferred"
+end
+
+-- CURRENCY SYSTEM (THALER)
+
+-- Deposit Thaler into faction bank
+function Factions.DepositThaler(userId, factionName, amount)
+	if amount <= 0 then
+		return false, "Amount must be positive"
+	end
+	
+	-- Rate limit check to prevent spam
+	local canProceed, err = checkPlayerRateLimit(userId, "DepositThaler")
+	if not canProceed then
+		return false, err
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Must be a member to deposit
+			if not factionData.Members[tostring(userId)] then
+				return nil
+			end
+			
+			factionData.Thaler = (factionData.Thaler or 0) + amount
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("DepositThaler", result)
+		return false, "Failed to deposit"
+	end
+	
+	if not result then
+		return false, "Not a member of this faction"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Deposited " .. amount .. " Thaler"
+end
+
+-- Withdraw Thaler from faction bank (requires WithdrawThaler permission)
+function Factions.WithdrawThaler(userId, factionName, amount)
+	if amount <= 0 then
+		return false, "Amount must be positive"
+	end
+	
+	-- Rate limit check
+	local canProceed, err = checkPlayerRateLimit(userId, "WithdrawThaler")
+	if not canProceed then
+		return false, err
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(userId, "WithdrawThaler") then
+				return nil
+			end
+			
+			local currentThaler = factionData.Thaler or 0
+			
+			-- Check sufficient funds
+			if currentThaler < amount then
+				return nil
+			end
+			
+			factionData.Thaler = currentThaler - amount
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("WithdrawThaler", result)
+		return false, "Failed to withdraw"
+	end
+	
+	if not result then
+		return false, "Permission denied or insufficient funds"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Withdrew " .. amount .. " Thaler"
+end
+
+-- Get Thaler balance
+function Factions.GetThalerBalance(factionName)
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return nil, "Faction not found"
+	end
+	return factionData.Thaler or 0
+end
+
+-- ARMORY SYSTEM
+
+-- Add item to faction armory
+function Factions.AddArmoryItem(userId, factionName, itemName)
+	-- Rate limit check
+	local canProceed, err = checkPlayerRateLimit(userId, "ArmoryOperation")
+	if not canProceed then
+		return false, err
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			-- Must be a member to add items
+			if not factionData.Members[tostring(userId)] then
+				return nil
+			end
+			
+			factionData.Armory = factionData.Armory or {}
+			
+			-- Check capacity
+			if #factionData.Armory >= ARMORY_CAPACITY then
+				return nil
+			end
+			
+			table.insert(factionData.Armory, itemName)
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("AddArmoryItem", result)
+		return false, "Failed to add item"
+	end
+	
+	if not result then
+		return false, "Not a member, or armory is full (capacity: " .. ARMORY_CAPACITY .. ")"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Added " .. itemName .. " to armory"
+end
+
+-- Remove item from armory (requires ManageArmory permission)
+function Factions.RemoveArmoryItem(userId, factionName, itemName)
+	-- Rate limit check
+	local canProceed, err = checkPlayerRateLimit(userId, "ArmoryOperation")
+	if not canProceed then
+		return false, err
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(userId, "ManageArmory") then
+				return nil
+			end
+			
+			factionData.Armory = factionData.Armory or {}
+			
+			-- Find and remove item
+			for i, item in ipairs(factionData.Armory) do
+				if item == itemName then
+					table.remove(factionData.Armory, i)
+					return factionData
+				end
+			end
+			
+			return nil -- Item not found
+		end)
+	end)
+	
+	if not success then
+		logError("RemoveArmoryItem", result)
+		return false, "Failed to remove item"
+	end
+	
+	if not result then
+		return false, "Permission denied or item not found"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Removed " .. itemName .. " from armory"
+end
+
+-- Get armory contents
+function Factions.GetArmory(factionName)
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return nil, "Faction not found"
+	end
+	return factionData.Armory or {}
+end
+
+-- RENOWN SYSTEM
+
+-- Give renown to faction (batched for optimization)
+function Factions.GiveRenown(factionName, amount)
+	if amount <= 0 then
+		return false, "Amount must be positive"
+	end
+	
+	-- Accumulate renown in memory instead of immediate DataStore write
+	return accumulateRenown(factionName, amount)
+end
+
+-- Get faction's current renown (includes pending batched renown)
+function Factions.GetRenown(factionName)
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return nil, "Faction not found"
+	end
+	
+	-- Return stored renown plus any pending batched renown
+	return factionData:GetRenown()
+end
+
+-- Get renown leaderboard
+function Factions.GetLeaderboard(limit)
+	limit = limit or 10
+	local leaderboard = {}
+	
+	--[[
+		Using OrderedDataStore to get sorted leaderboard.
+		GetSortedAsync returns a DataStorePages object that we can iterate through.
+	--]]
+	local success, pages = pcall(function()
+		return RenownLeaderboard:GetSortedAsync(false, limit)
+	end)
+	
+	if not success then
+		logError("GetLeaderboard", pages)
+		return leaderboard
+	end
+	
+	local topFactions = pages:GetCurrentPage()
+	
+	-- Include pending renown in leaderboard display
+	for _, entry in ipairs(topFactions) do
+		local pendingAmount = pendingRenown[entry.key] or 0
+		table.insert(leaderboard, {
+			Name = entry.key,
+			Renown = entry.value + pendingAmount
+		})
+	end
+	
+	return leaderboard
+end
+
+-- MEMBER MANAGEMENT
+
+-- Kick member from faction (requires KickMembers permission and rank hierarchy)
+function Factions.KickMember(kickerId, targetUserId, factionName)
+	if kickerId == targetUserId then
+		return false, "Cannot kick yourself (use LeaveFaction instead)"
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(kickerId, "KickMembers") then
+				return nil
+			end
+			
+			-- Check if target is a member
+			if not faction:IsMember(targetUserId) then
+				return nil
+			end
+			
+			-- Check rank hierarchy (can only kick people below you)
+			if not faction:CanManageUser(kickerId, targetUserId) then
+				return nil
+			end
+			
+			-- Remove member
+			factionData.Members[tostring(targetUserId)] = nil
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("KickMember", result)
+		return false, "Failed to kick member"
+	end
+	
+	if not result then
+		return false, "Permission denied or target cannot be kicked"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	savePlayerFaction(targetUserId, nil)
+	broadcastFactionUpdate(factionName, "Update")
+	
+	-- Notify other servers to kick the player if they're online
+	pcall(function()
+		MessagingService:PublishAsync(FACTION_KICK_TOPIC, {
+			UserId = targetUserId,
+			Timestamp = os.time()
+		})
+	end)
+	
+	return true, "Player kicked from faction"
+end
+
+-- CUSTOMIZATION SYSTEM
+
+-- Set faction shirt ID (requires EditArmor permission)
+function Factions.SetShirtId(userId, factionName, shirtId)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			if not faction:HasPermission(userId, "EditArmor") then
+				return nil
+			end
+			
+			factionData.ShirtId = shirtId
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("SetShirtId", result)
+		return false, "Failed to set shirt ID"
+	end
+	
+	if not result then
+		return false, "Permission denied"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Shirt ID updated"
+end
+
+-- Set faction pants ID (requires EditArmor permission)
+function Factions.SetPantsId(userId, factionName, pantsId)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			if not faction:HasPermission(userId, "EditArmor") then
+				return nil
+			end
+			
+			factionData.PantsId = pantsId
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("SetPantsId", result)
+		return false, "Failed to set pants ID"
+	end
+	
+	if not result then
+		return false, "Permission denied"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Pants ID updated"
+end
+
+-- Set faction image ID (requires EditImage permission)
+function Factions.SetImageId(userId, factionName, imageId)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			if not faction:HasPermission(userId, "EditImage") then
+				return nil
+			end
+			
+			factionData.ImageId = imageId
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("SetImageId", result)
+		return false, "Failed to set image ID"
+	end
+	
+	if not result then
+		return false, "Permission denied"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Image ID updated"
+end
+
+-- Set faction color (requires SetColor permission)
+function Factions.SetColor(userId, factionName, r, g, b)
+	-- Validate RGB values
+	if r < 0 or r > 255 or g < 0 or g > 255 or b < 0 or b > 255 then
+		return false, "RGB values must be between 0 and 255"
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			if not faction:HasPermission(userId, "SetColor") then
+				return nil
+			end
+			
+			factionData.Color = {r = r, g = g, b = b}
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("SetColor", result)
+		return false, "Failed to set color"
+	end
+	
+	if not result then
+		return false, "Permission denied"
+	end
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Color updated"
+end
+
+-- Regenerate faction join code (requires GenerateJoinCode permission)
+function Factions.RegenerateJoinCode(userId, factionName)
+	local newCode = generateJoinCode()
+	
+	-- Get current faction data to retrieve old join code
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return false, "Faction not found"
+	end
+	
+	local oldJoinCode = factionData.JoinCode
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			if not faction:HasPermission(userId, "GenerateJoinCode") then
+				return nil
+			end
+			
+			factionData.JoinCode = newCode
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("RegenerateJoinCode", result)
+		return false, "Failed to regenerate join code"
+	end
+	
+	if not result then
+		return false, "Permission denied"
+	end
+	
+	-- Update join code mappings
+	pcall(function()
+		FactionJoinCodes:SetAsync(newCode, factionName)
+		FactionJoinCodes:RemoveAsync(oldJoinCode)
+	end)
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Join code regenerated: " .. newCode
+end
+
+-- TERRITORY SYSTEM (CFrame/Vector3 Mathematics)
+
+--[[
+	Territory system allows factions to claim areas of the map.
+	Uses CFrame and Vector3 mathematics for spatial calculations.
+--]]
+
+-- Claim territory at a position (requires ManageFaction permission)
+function Factions.ClaimTerritory(userId, factionName, centerPosition, radius)
+	radius = radius or TERRITORY_RADIUS
+	
+	-- Validate position
+	if typeof(centerPosition) ~= "Vector3" then
+		return false, "Invalid position (must be Vector3)"
+	end
+	
+	-- Validate radius
+	if radius <= 0 or radius > 500 then
+		return false, "Radius must be between 1 and 500 studs"
+	end
+	
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			-- Check permission
+			if not faction:HasPermission(userId, "ManageFaction") then
+				return nil
+			end
+			
+			-- Set territory data
+			factionData.Territory = {
+				Center = centerPosition,
+				Radius = radius,
+				ClaimedAt = os.time()
+			}
+			
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("ClaimTerritory", result)
+		return false, "Failed to claim territory"
+	end
+	
+	if not result then
+		return false, "Permission denied or faction not found"
+	end
+	
+	-- Cache territory data separately for quick lookups
+	territoryCache[factionName] = result.Territory
+	
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Territory claimed"
+end
+
+-- Check if a position is within faction territory
+function Factions.IsPositionInTerritory(factionName, position)
+	if typeof(position) ~= "Vector3" then
+		return false, "Invalid position (must be Vector3)"
+	end
+	
+	local factionData = Factions.GetFactionInfo(factionName)
+	if not factionData then
+		return false, "Faction not found"
+	end
+	
+	-- Use metatable method for position checking
+	return factionData:IsPositionInTerritory(position)
+end
+
+-- Get faction that owns a position (checks all factions)
+function Factions.GetTerritoryOwner(position)
+	if typeof(position) ~= "Vector3" then
+		return nil, "Invalid position (must be Vector3)"
+	end
+	
+	--[[
+		This is an expensive operation as it checks all factions.
+		In production, you might want to implement spatial partitioning
+		for better performance with many factions.
+	--]]
+	
+	-- Check cached territories first
+	for factionName, territory in pairs(territoryCache) do
+		local displacement = position - territory.Center
+		if displacement.Magnitude <= territory.Radius then
+			return factionName
+		end
+	end
+	
+	return nil
+end
+
+-- Remove faction territory (requires ManageFaction permission)
+function Factions.RemoveTerritory(userId, factionName)
+	local success, result = pcall(function()
+		return FactionsStore:UpdateAsync(factionName, function(factionData)
+			if not factionData then
+				return nil
+			end
+			
+			local faction = FactionMeta.new(factionData)
+			
+			if not faction:HasPermission(userId, "ManageFaction") then
+				return nil
+			end
+			
+			factionData.Territory = nil
+			return factionData
+		end)
+	end)
+	
+	if not success then
+		logError("RemoveTerritory", result)
+		return false, "Failed to remove territory"
+	end
+	
+	if not result then
+		return false, "Permission denied or faction not found"
+	end
+	
+	territoryCache[factionName] = nil
+	setCacheWithExpiration(factionName, result)
+	broadcastFactionUpdate(factionName, "Update")
+	return true, "Territory removed"
+end
+
+-- CLEANUP AND SHUTDOWN
+
+-- Clear player cache when they leave the game
+Players.PlayerRemoving:Connect(function(player)
+	playerFactionCache[player.UserId] = nil
+	playerLastRequest[player.UserId] = nil
+end)
+
+-- Flush all pending data on server shutdown
+game:BindToClose(function()
+	-- Flush all pending renown to DataStore
+	Factions.ForceFlushAllRenown()
+	
+	-- Give DataStore operations time to complete
+	task.wait(3)
+end)
+
+return Factions
