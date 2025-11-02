@@ -272,7 +272,7 @@ local function generateJoinCode()
 	return tostring(math.random(1000000, 9999999))
 end
 
--- ========== RATE LIMITING SYSTEM ==========
+-- RATE LIMITING SYSTEM
 --[[
 	Prevents players from spamming operations that could cause DataStore throttling.
 	Each operation type has its own cooldown timer per player.
